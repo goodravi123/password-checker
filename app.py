@@ -1,6 +1,98 @@
 import os
 import webbrowser
 import tempfile
+import base64
+import binascii
+import re
+
+def decode_password(encoded):
+    """Attempt to decode an encoded password string.
+
+    This helper performs a best-effort attempt using a variety of common
+    encodings/formats.  It returns the first decoded value that appears to
+    be a valid UTF‑8 string; otherwise the original input is returned.
+
+    Currently the following strategies are tried, in order:
+
+    1. **Hexadecimal** (plain `0-9a-f` pairs)
+    2. **URL percent‑encoding** (``urllib.parse.unquote``)
+    3. **ASCII numerical lists** – a sequence of integer values
+       separated by spaces or commas, interpreted as character codes
+       (bytes or Unicode code points).
+    4. **Base64** (with automatic padding correction)
+    5. **ROT13** transformation (only letters-only inputs are considered)
+
+    Additional encodings may be added in the future.
+    """
+    # helper to check if decoded text is nonempty, printable, and ASCII
+    def _valid_text(s: str) -> bool:
+        # require at least one character
+        if not s:
+            return False
+        # all characters should be ASCII printable (excluding control/high-bit)
+        for ch in s:
+            o = ord(ch)
+            if o < 32 or o >= 127 or not ch.isprintable():
+                return False
+        return True
+
+    # 1. hex – test first because hex strings are also valid base64
+    try:
+        decoded_bytes = bytes.fromhex(encoded)
+        decoded = decoded_bytes.decode("utf-8", errors="ignore")
+        if _valid_text(decoded):
+            return decoded
+    except Exception:
+        pass
+
+    # 2. URL‑percent decoding
+    try:
+        from urllib.parse import unquote
+
+        decoded = unquote(encoded)
+        if decoded != encoded and _valid_text(decoded):
+            return decoded
+    except Exception:
+        pass
+
+    # 3. ascii codes separated by space/comma
+    try:
+        parts = [p for p in re.split(r"[\s,]+", encoded.strip()) if p]
+        if parts and all(p.isdigit() for p in parts):
+            chars = [chr(int(p)) for p in parts]
+            decoded = "".join(chars)
+            if _valid_text(decoded):
+                return decoded
+    except Exception:
+        pass
+
+    # 4. base64 – decode after the simpler formats
+    try:
+        padding = len(encoded) % 4
+        if padding:
+            encoded_mod = encoded + "=" * (4 - padding)
+        else:
+            encoded_mod = encoded
+        decoded_bytes = base64.b64decode(encoded_mod, validate=True)
+        decoded = decoded_bytes.decode("utf-8", errors="ignore")
+        if _valid_text(decoded):
+            return decoded
+    except Exception:
+        pass
+
+    # 5. rot13 – only if the string is letters-only (avoids colliding with base64)
+    try:
+        if re.fullmatch(r"[A-Za-z]+", encoded):
+            import codecs
+
+            decoded = codecs.decode(encoded, "rot_13")
+            if decoded != encoded and _valid_text(decoded):
+                return decoded
+    except Exception:
+        pass
+
+    # fallback – return original
+    return encoded
 
 def scan_password(password, folder_path):
     """
@@ -96,12 +188,46 @@ def display_file_with_highlight(file_path, password, line_number):
     except Exception as e:
         print(f"Error displaying file: {e}")
 
+# helper for user interaction
+
+def ask_yes_no(prompt: str) -> bool:
+    """Prompt with *prompt* and return True for yes, False for no.
+
+    Repeats until the user answers with something starting with 'y' or 'n'.
+    """
+    while True:
+        ans = input(prompt + " (y/n): ").strip().lower()
+        if not ans:
+            continue
+        if ans[0] == "y":
+            return True
+        if ans[0] == "n":
+            return False
+        print("Please answer 'y' or 'n'.")
+
+
 # Example usage
 if __name__ == "__main__":
     password_to_check = input("Enter the password to scan: ")
+
+    # explicitly ask if the input is encoded
+    if ask_yes_no("Is it encoded?"):
+        decoded_value = decode_password(password_to_check)
+        if decoded_value != password_to_check:
+            print(f"Decoded to '{decoded_value}'")
+            password_to_check = decoded_value
+        else:
+            print("Decoding attempt produced no change.")
+
     path_to_folder = input("Enter the path to the folder containing password lists: ")
-    
+
     if not os.path.exists(path_to_folder):
         print("Invalid folder path. Please provide a valid path.")
     else:
         scan_password(password_to_check, path_to_folder)
+
+    # if running in a standalone cmd window, keep it open until user closes
+    try:
+        input("\nPress Enter to exit... ")
+    except Exception:
+        pass
