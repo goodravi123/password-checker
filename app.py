@@ -5,6 +5,15 @@ import base64
 import binascii
 import re
 
+# common online password lists (raw GitHub URLs or similar)
+# users can add their own, or rely on these defaults
+DEFAULT_ONLINE_LISTS = [
+    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/10k-most-common.txt",
+    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/20k-most-common.txt",
+    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/100k-most-common.txt",
+    # other sources may be added here as desired
+]
+
 def decode_password(encoded):
     """Attempt to decode an encoded password string.
 
@@ -122,7 +131,7 @@ def scan_password(password, folder_path):
             except Exception as e:
                 print(f"Error reading file {file_name}: {e}")
 
-    print("[NO MATCH] Password not found in any file.")
+    # no match in local files
     return False
 
 def display_file_with_highlight(file_path, password, line_number):
@@ -188,6 +197,46 @@ def display_file_with_highlight(file_path, password, line_number):
     except Exception as e:
         print(f"Error displaying file: {e}")
 
+# online scanning helpers
+
+def scan_url(password, url):
+    """Fetch a text file from *url* and look for *password* in its lines.
+
+    Returns True on first match.
+    """
+    try:
+        from urllib.request import urlopen
+        resp = urlopen(url, timeout=15)
+        line_num = 0
+        for raw in resp:
+            line_num += 1
+            try:
+                line = raw.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+            if password == line:
+                print(f"[MATCH FOUND] Password '{password}' found in online list: {url} (line {line_num})")
+                return True
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+    return False
+
+
+def scan_online_passwords(password, urls):
+    """Try a sequence of URLs containing password lists.
+
+    The *urls* argument may be a list of raw Github URLs or any plain-text
+    resource.  The function downloads each resource and checks it line by
+    line.  It prints progress and stops on the first positive hit.
+    """
+    print("\nChecking online password lists...")
+    for url in urls:
+        print(f"  -> {url}")
+        if scan_url(password, url):
+            return True
+    print("[NO MATCH] Password not found in any online list.")
+    return False
+
 # helper for user interaction
 
 def ask_yes_no(prompt: str) -> bool:
@@ -223,8 +272,17 @@ if __name__ == "__main__":
 
     if not os.path.exists(path_to_folder):
         print("Invalid folder path. Please provide a valid path.")
+        found = False
     else:
-        scan_password(password_to_check, path_to_folder)
+        found = scan_password(password_to_check, path_to_folder)
+
+    # if local search didn't produce a hit, ask about online lists
+    if not found and ask_yes_no("Search some common online password lists?"):
+        urls = list(DEFAULT_ONLINE_LISTS)  # copy
+        extra = input("Enter additional list URLs (comma-separated) or press Enter to use defaults: ").strip()
+        if extra:
+            urls.extend([u.strip() for u in extra.split(",") if u.strip()])
+        scan_online_passwords(password_to_check, urls)
 
     # if running in a standalone cmd window, keep it open until user closes
     try:
