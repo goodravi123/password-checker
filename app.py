@@ -4,6 +4,9 @@ import tempfile
 import base64
 import binascii
 import re
+from flask import Flask, request, render_template_string
+
+app = Flask(__name__)
 
 # common online password lists (raw GitHub URLs or similar)
 # users can add their own, or rely on these defaults
@@ -111,7 +114,11 @@ def scan_password(password, folder_path):
     Args:
         password (str): The password to check.
         folder_path (str): The path to the folder containing the password lists.
+    
+    Returns:
+        dict: {'found': bool, 'messages': list of str, 'html': str or None}
     """
+    messages = []
     # Iterate over all files in the given folder
     for file_name in os.listdir(folder_path):
         file_path = os.path.join(folder_path, file_name)
@@ -120,29 +127,32 @@ def scan_password(password, folder_path):
         if os.path.isfile(file_path):
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
-                    print(f"Scanning in file: {file_name}")
+                    messages.append(f"Scanning in file: {file_name}")
                     # Search each line for the password
                     line_number = 0
                     for line in file:
                         line_number += 1
                         if password == line.strip():
-                            print(f"[MATCH FOUND] Password '{password}' found in file: {file_name} at line {line_number}")
-                            display_file_with_highlight(file_path, password, line_number)
-                            return True
+                            messages.append(f"[MATCH FOUND] Password '{password}' found in file: {file_name} at line {line_number}")
+                            html = display_file_with_highlight(file_path, password, line_number)
+                            return {'found': True, 'messages': messages, 'html': html}
             except Exception as e:
-                print(f"Error reading file {file_name}: {e}")
+                messages.append(f"Error reading file {file_name}: {e}")
 
     # no match in local files
-    return False
+    return {'found': False, 'messages': messages, 'html': None}
 
 def display_file_with_highlight(file_path, password, line_number):
     """
-    Display the file content in a browser with the matched password highlighted.
+    Return HTML content with the matched password highlighted.
     
     Args:
         file_path (str): Path to the file containing the password.
         password (str): The password to highlight.
         line_number (int): The line number where the password was found.
+    
+    Returns:
+        str: HTML content.
     """
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
@@ -188,15 +198,9 @@ def display_file_with_highlight(file_path, password, line_number):
         </html>
         """
         
-        # Write to temporary file and open in browser
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as temp_file:
-            temp_file.write(html_content)
-            temp_file_path = temp_file.name
-        
-        webbrowser.open('file://' + temp_file_path)
-        print(f"Displaying file content in browser...")
+        return html_content
     except Exception as e:
-        print(f"Error displaying file: {e}")
+        return f"<p>Error displaying file: {e}</p>"
 
 # online scanning helpers
 
@@ -216,10 +220,9 @@ def scan_url(password, url):
             except Exception:
                 continue
             if password == line:
-                print(f"[MATCH FOUND] Password '{password}' found in online list: {url} (line {line_num})")
                 return True
     except Exception as e:
-        print(f"Error fetching {url}: {e}")
+        pass  # silently ignore errors for online
     return False
 
 
@@ -229,14 +232,18 @@ def scan_online_passwords(password, urls):
     The *urls* argument may be a list of raw Github URLs or any plain-text
     resource.  The function downloads each resource and checks it line by
     line.  It prints progress and stops on the first positive hit.
+    
+    Returns:
+        dict: {'found': bool, 'messages': list of str}
     """
-    print("\nChecking online password lists...")
+    messages = []
+    messages.append("\nChecking online password lists...")
     for url in urls:
-        print(f"  -> {url}")
+        messages.append(f"  -> {url}")
         if scan_url(password, url):
-            return True
-    print("[NO MATCH] Password not found in any online list.")
-    return False
+            return {'found': True, 'messages': messages}
+    messages.append("[NO MATCH] Password not found in any online list.")
+    return {'found': False, 'messages': messages}
 
 # helper for user interaction
 
@@ -256,37 +263,83 @@ def ask_yes_no(prompt: str) -> bool:
         print("Please answer 'y' or 'n'.")
 
 
-# Example usage
-if __name__ == "__main__":
-    password_to_check = input("Enter the password to scan: ")
-
-    # explicitly ask if the input is encoded
-    if ask_yes_no("Is it encoded?"):
-        decoded_value = decode_password(password_to_check)
-        if decoded_value != password_to_check:
-            print(f"Decoded to '{decoded_value}'")
-            password_to_check = decoded_value
-        else:
-            print("Decoding attempt produced no change.")
-
-    path_to_folder = input("Enter the path to the folder containing password lists: ")
-
-    if not os.path.exists(path_to_folder):
-        print("Invalid folder path. Please provide a valid path.")
+# Web app
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        password_to_check = request.form['password']
+        is_encoded = 'encoded' in request.form
+        folder_path = request.form['folder']
+        check_online = 'online' in request.form
+        extra_urls = request.form.get('extra_urls', '').strip()
+        
+        messages = []
+        
+        if is_encoded:
+            decoded_value = decode_password(password_to_check)
+            if decoded_value != password_to_check:
+                messages.append(f"Decoded to '{decoded_value}'")
+                password_to_check = decoded_value
+            else:
+                messages.append("Decoding attempt produced no change.")
+        
         found = False
-    else:
-        found = scan_password(password_to_check, path_to_folder)
+        html = None
+        if os.path.exists(folder_path):
+            result = scan_password(password_to_check, folder_path)
+            messages.extend(result['messages'])
+            if result['found']:
+                found = True
+                html = result['html']
+        else:
+            messages.append("Invalid folder path. Please provide a valid path.")
+        
+        if not found and check_online:
+            urls = list(DEFAULT_ONLINE_LISTS)
+            if extra_urls:
+                urls.extend([u.strip() for u in extra_urls.split(",") if u.strip()])
+            online_result = scan_online_passwords(password_to_check, urls)
+            messages.extend(online_result['messages'])
+            if online_result['found']:
+                found = True
+        
+        return render_template_string("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Password Checker</title>
+        </head>
+        <body>
+            <h1>Password Checker Results</h1>
+            <pre>{{ messages|join('\n') }}</pre>
+            {% if html %}
+            <hr>
+            {{ html|safe }}
+            {% endif %}
+            <br><a href="/">Check another password</a>
+        </body>
+        </html>
+        """, messages=messages, html=html)
+    
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Password Checker</title>
+    </head>
+    <body>
+        <h1>Password Checker</h1>
+        <form method="post">
+            <label>Password: <input type="text" name="password" required></label><br>
+            <label><input type="checkbox" name="encoded"> Is it encoded?</label><br>
+            <label>Folder path: <input type="text" name="folder" required></label><br>
+            <label><input type="checkbox" name="online"> Check online lists?</label><br>
+            <label>Extra URLs (comma-separated): <input type="text" name="extra_urls"></label><br>
+            <input type="submit" value="Check">
+        </form>
+    </body>
+    </html>
+    """)
 
-    # if local search didn't produce a hit, ask about online lists
-    if not found and ask_yes_no("Search some common online password lists?"):
-        urls = list(DEFAULT_ONLINE_LISTS)  # copy
-        extra = input("Enter additional list URLs (comma-separated) or press Enter to use defaults: ").strip()
-        if extra:
-            urls.extend([u.strip() for u in extra.split(",") if u.strip()])
-        scan_online_passwords(password_to_check, urls)
-
-    # if running in a standalone cmd window, keep it open until user closes
-    try:
-        input("\nPress Enter to exit... ")
-    except Exception:
-        pass
+if __name__ == "__main__":
+    app.run(debug=True)
