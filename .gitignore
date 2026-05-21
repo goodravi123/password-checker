@@ -1,0 +1,15 @@
+.cache/
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+.env
+.vscode/
+*.pyc
+*.pyo
+bulk_report*.csv
+lists/*.txt
+lists/*.gz
+hashes/*.txt
+!lists/.gitkeep
+!hashes/.gitkeep

@@ -1,0 +1,60 @@
+# Password Checker configuration
+
+app:
+  host: "127.0.0.1"
+  port: 5000
+  version: "3.0.0"
+  local_only: true
+  # Set FLASK_SECRET_KEY env var for production (see .env.example)
+
+paths:
+  lists_dir: "lists"
+  hashes_dir: "hashes"
+  cache_dir: ".cache"
+
+scan:
+  case_insensitive: true
+  stop_on_first_match: true
+  check_hibp: true
+  check_local: true
+  check_hashes: true
+  check_online: false
+  fast_profile: false
+  check_variants: true
+  check_substring: false
+  privacy_mode: false
+  only_hibp: false
+  list_extensions: [".txt", ".lst", ".gz"]
+
+hibp:
+  timeout: 12
+  retries: 3
+
+download:
+  timeout: 30
+  retries: 3
+  workers: 4
+
+index:
+  batch_size: 25000
+  bloom_min_bytes: 5000000
+  preview_context_lines: 5
+
+online_lists:
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/best105.txt"
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/Pwdb_top-1000.txt"
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/10k-most-common.txt"
+
+online_lists_full:
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/20k-most-common.txt"
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/darkweb2017-top10000.txt"
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/Pwdb_top-10000.txt"
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/100k-most-common.txt"
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/Pwdb_top-100000.txt"
+  - "https://raw.githubusercontent.com/berandal666/Passwords/refs/heads/master/10_million_password_list_top_1000000.txt"
+
+mirror_lists: []
+
+small_lists_download:
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/best105.txt"
+  - "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/10k-most-common.txt"

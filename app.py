@@ -1,345 +1,272 @@
+"""Password Checker — web UI + REST API."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import logging
 import os
-import webbrowser
-import tempfile
-import base64
-import binascii
-import re
-from flask import Flask, request, render_template_string
+import secrets
+import sys
+import time
+from datetime import datetime
+from functools import wraps
+from pathlib import Path
+
+from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
+
+from config import BASE_DIR, load_config, path_from_config, secret_key
+from decode import decode_password_candidates
+from indexer import clear_cache, iter_list_files, prebuild_folder, rg_available, read_context_lines
+from scanner import bulk_check_file, download_small_lists, run_full_check
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
+AUDIT_LOG = BASE_DIR / ".cache" / "audit.log"
+HISTORY_FILE = BASE_DIR / ".cache" / "history.json"
 
-# common online password lists (raw GitHub URLs or similar)
-# users can add their own, or rely on these defaults
-DEFAULT_ONLINE_LISTS = [
-    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/10k-most-common.txt",
-    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/20k-most-common.txt",
-    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/100k-most-common.txt",
-    "https://raw.githubusercontent.com/berandal666/Passwords/refs/heads/master/10_million_password_list_top_1000000.txt"   
-    # other sources may be added here as desired
-]
-
-def decode_password(encoded):
-    """Attempt to decode an encoded password string.
-
-    This helper performs a best-effort attempt using a variety of common
-    encodings/formats.  It returns the first decoded value that appears to
-    be a valid UTF‑8 string; otherwise the original input is returned.
-
-    Currently the following strategies are tried, in order:
-
-    1. **Hexadecimal** (plain `0-9a-f` pairs)
-    2. **URL percent‑encoding** (``urllib.parse.unquote``)
-    3. **ASCII numerical lists** – a sequence of integer values
-       separated by spaces or commas, interpreted as character codes
-       (bytes or Unicode code points).
-    4. **Base64** (with automatic padding correction)
-    5. **ROT13** transformation (only letters-only inputs are considered)
-
-    Additional encodings may be added in the future.
-    """
-    # helper to check if decoded text is nonempty, printable, and ASCII
-    def _valid_text(s: str) -> bool:
-        # require at least one character
-        if not s:
-            return False
-        # all characters should be ASCII printable (excluding control/high-bit)
-        for ch in s:
-            o = ord(ch)
-            if o < 32 or o >= 127 or not ch.isprintable():
-                return False
-        return True
-
-    # 1. hex – test first because hex strings are also valid base64
-    try:
-        decoded_bytes = bytes.fromhex(encoded)
-        decoded = decoded_bytes.decode("utf-8", errors="ignore")
-        if _valid_text(decoded):
-            return decoded
-    except Exception:
-        pass
-
-    # 2. URL‑percent decoding
-    try:
-        from urllib.parse import unquote
-
-        decoded = unquote(encoded)
-        if decoded != encoded and _valid_text(decoded):
-            return decoded
-    except Exception:
-        pass
-
-    # 3. ascii codes separated by space/comma
-    try:
-        parts = [p for p in re.split(r"[\s,]+", encoded.strip()) if p]
-        if parts and all(p.isdigit() for p in parts):
-            chars = [chr(int(p)) for p in parts]
-            decoded = "".join(chars)
-            if _valid_text(decoded):
-                return decoded
-    except Exception:
-        pass
-
-    # 4. base64 – decode after the simpler formats
-    try:
-        padding = len(encoded) % 4
-        if padding:
-            encoded_mod = encoded + "=" * (4 - padding)
-        else:
-            encoded_mod = encoded
-        decoded_bytes = base64.b64decode(encoded_mod, validate=True)
-        decoded = decoded_bytes.decode("utf-8", errors="ignore")
-        if _valid_text(decoded):
-            return decoded
-    except Exception:
-        pass
-
-    # 5. rot13 – only if the string is letters-only (avoids colliding with base64)
-    try:
-        if re.fullmatch(r"[A-Za-z]+", encoded):
-            import codecs
-
-            decoded = codecs.decode(encoded, "rot_13")
-            if decoded != encoded and _valid_text(decoded):
-                return decoded
-    except Exception:
-        pass
-
-    # fallback – return original
-    return encoded
-
-def scan_password(password, folder_path):
-    """
-    Function to scan a given password against password lists in a folder.
-    
-    Args:
-        password (str): The password to check.
-        folder_path (str): The path to the folder containing the password lists.
-    
-    Returns:
-        dict: {'found': bool, 'messages': list of str, 'html': str or None}
-    """
-    messages = []
-    # Iterate over all files in the given folder
-    for file_name in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, file_name)
-
-        # Check if it is a file (and not a directory)
-        if os.path.isfile(file_path):
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
-                    messages.append(f"Scanning in file: {file_name}")
-                    # Search each line for the password
-                    line_number = 0
-                    for line in file:
-                        line_number += 1
-                        if password == line.strip():
-                            messages.append(f"[MATCH FOUND] Password '{password}' found in file: {file_name} at line {line_number}")
-                            html = display_file_with_highlight(file_path, password, line_number)
-                            return {'found': True, 'messages': messages, 'html': html}
-            except Exception as e:
-                messages.append(f"Error reading file {file_name}: {e}")
-
-    # no match in local files
-    return {'found': False, 'messages': messages, 'html': None}
-
-def display_file_with_highlight(file_path, password, line_number):
-    """
-    Return HTML content with the matched password highlighted.
-    
-    Args:
-        file_path (str): Path to the file containing the password.
-        password (str): The password to highlight.
-        line_number (int): The line number where the password was found.
-    
-    Returns:
-        str: HTML content.
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
-            lines = file.readlines()
-        
-        # Create HTML content with highlighted password
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Password Found - {os.path.basename(file_path)}</title>
-            <style>
-                body {{ font-family: monospace; background-color: #f5f5f5; padding: 20px; }}
-                .container {{ background-color: white; padding: 20px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-                .line {{ padding: 5px; margin: 2px 0; }}
-                .highlight {{ background-color: yellow; font-weight: bold; }}
-                .match-line {{ background-color: #fff3cd; border-left: 3px solid #ffc107; padding-left: 10px; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h2>Password Match Found!</h2>
-                <p><strong>File:</strong> {os.path.basename(file_path)}</p>
-                <p><strong>Password:</strong> <span class="highlight">{password}</span></p>
-                <p><strong>Location:</strong> Line {line_number}</p>
-                <hr>
-                <h3>File Content:</h3>
-                <pre>
-        """
-        
-        # Add lines with highlighting
-        for i, line in enumerate(lines, 1):
-            if i == line_number:
-                highlighted_line = line.rstrip().replace(password, f'<span class="highlight">{password}</span>')
-                html_content += f'<div class="line match-line"><strong>{i}:</strong> {highlighted_line}</div>\n'
-            else:
-                html_content += f'<div class="line"><strong>{i}:</strong> {line.rstrip()}</div>\n'
-        
-        html_content += """
-                </pre>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return html_content
-    except Exception as e:
-        return f"<p>Error displaying file: {e}</p>"
-
-# online scanning helpers
-
-def scan_url(password, url):
-    """Fetch a text file from *url* and look for *password* in its lines.
-
-    Returns True on first match.
-    """
-    try:
-        from urllib.request import urlopen
-        resp = urlopen(url, timeout=15)
-        line_num = 0
-        for raw in resp:
-            line_num += 1
-            try:
-                line = raw.decode("utf-8", errors="ignore").strip()
-            except Exception:
-                continue
-            if password == line:
-                return True
-    except Exception as e:
-        pass  # silently ignore errors for online
-    return False
+SCAN_OPTION_MAP = {
+    "case_insensitive": "case_insensitive",
+    "variants": "check_variants",
+    "hibp": "check_hibp",
+    "local": "check_local",
+    "hashes": "check_hashes",
+    "online": "check_online",
+    "fast": "fast_profile",
+    "only_hibp": "only_hibp",
+    "substring": "check_substring",
+    "privacy": "privacy_mode",
+    "stop_early": "stop_on_first_match",
+}
 
 
-def scan_online_passwords(password, urls):
-    """Try a sequence of URLs containing password lists.
-
-    The *urls* argument may be a list of raw Github URLs or any plain-text
-    resource.  The function downloads each resource and checks it line by
-    line.  It prints progress and stops on the first positive hit.
-    
-    Returns:
-        dict: {'found': bool, 'messages': list of str}
-    """
-    messages = []
-    messages.append("\nChecking online password lists...")
-    for url in urls:
-        messages.append(f"  -> {url}")
-        if scan_url(password, url):
-            return {'found': True, 'messages': messages}
-    messages.append("[NO MATCH] Password not found in any online list.")
-    return {'found': False, 'messages': messages}
-
-# helper for user interaction
-
-def ask_yes_no(prompt: str) -> bool:
-    """Prompt with *prompt* and return True for yes, False for no.
-
-    Repeats until the user answers with something starting with 'y' or 'n'.
-    """
-    while True:
-        ans = input(prompt + " (y/n): ").strip().lower()
-        if not ans:
-            continue
-        if ans[0] == "y":
-            return True
-        if ans[0] == "n":
-            return False
-        print("Please answer 'y' or 'n'.")
+def _cfg() -> dict:
+    return load_config()
 
 
-# Web app
-@app.route('/', methods=['GET', 'POST'])
+def _apply_scan_options(cfg: dict, opts: dict) -> None:
+    scan = cfg.setdefault("scan", {})
+    for api_key, cfg_key in SCAN_OPTION_MAP.items():
+        if api_key in opts:
+            scan[cfg_key] = bool(opts[api_key])
+
+
+def _csrf_token() -> str:
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_hex(16)
+    return session["csrf"]
+
+
+def _csrf_post(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if request.form.get("csrf") != session.get("csrf"):
+            flash("Sessie verlopen.")
+            return redirect(url_for("index"))
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@app.before_request
+def _local_only():
+    if not _cfg().get("app", {}).get("local_only", True):
+        return
+    if request.endpoint and request.endpoint.startswith("static"):
+        return
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        abort(403)
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    return resp
+
+
+def _audit(found: bool, sources: list) -> None:
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    types = ",".join(s.get("type", "?") for s in sources)
+    with AUDIT_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().isoformat()} found={found} sources={types}\n")
+
+
+def _history_append(found: bool) -> None:
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    hist = json.loads(HISTORY_FILE.read_text(encoding="utf-8")) if HISTORY_FILE.is_file() else []
+    hist.append({"time": datetime.now().isoformat(), "found": found})
+    HISTORY_FILE.write_text(json.dumps(hist[-50:]), encoding="utf-8")
+
+
+def _preview_html(match: dict | None, lists_dir: Path, context: int) -> str:
+    if not match or not match.get("file_name"):
+        return ""
+    path = lists_dir / match["file_name"]
+    if not path.is_file() and match.get("file_path"):
+        path = Path(match["file_path"])
+    if not path.is_file():
+        return ""
+    line_num = match.get("line_number", 1)
+    return "".join(
+        f'<div class="{"match-line" if i == line_num else "line"}"><strong>{i}:</strong> {html.escape(t)}</div>'
+        for i, t in read_context_lines(path, line_num, context)
+    )
+
+
+def _run_check(password: str, opts: dict) -> dict:
+    if not password.strip():
+        return {"ok": False, "found": False, "status": "FOUT", "messages": ["Leeg wachtwoord."]}
+
+    cfg = _cfg()
+    _apply_scan_options(cfg, opts)
+    passwords = decode_password_candidates(password) if opts.get("encoded") else [password]
+
+    dirs = {k: path_from_config(cfg, k) for k in ("lists_dir", "hashes_dir", "cache_dir")}
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    result = run_full_check(password, lists_dir=dirs["lists_dir"], hashes_dir=dirs["hashes_dir"], cache_dir=dirs["cache_dir"], cfg=cfg, decoded_passwords=passwords)
+    _audit(result["found"], result.get("sources", []))
+    _history_append(result["found"])
+
+    preview = ""
+    if result.get("match") and not cfg.get("scan", {}).get("privacy_mode"):
+        preview = _preview_html(result["match"], dirs["lists_dir"], cfg.get("index", {}).get("preview_context_lines", 5))
+
+    return {**result, "ok": True, "preview_html": preview}
+
+
+def _status_payload() -> dict:
+    cfg = _cfg()
+    lists_dir, hashes_dir, cache_dir = (path_from_config(cfg, k) for k in ("lists_dir", "hashes_dir", "cache_dir"))
+    cache_mb = round(sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file()) / 1048576, 2) if cache_dir.is_dir() else 0
+    recent = []
+    if HISTORY_FILE.is_file():
+        try:
+            recent = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))[-10:]
+        except json.JSONDecodeError:
+            pass
+    return {
+        "ok": True,
+        "version": cfg["app"].get("version", "3.0"),
+        "ripgrep": bool(rg_available()),
+        "lists_count": len(list(iter_list_files(lists_dir))) if lists_dir.is_dir() else 0,
+        "hashes_count": len(list(iter_list_files(hashes_dir))) if hashes_dir.is_dir() else 0,
+        "cache_mb": cache_mb,
+        "recent_checks": recent,
+    }
+
+
+@app.route("/")
 def index():
-    if request.method == 'POST':
-        password_to_check = request.form['password']
-        is_encoded = 'encoded' in request.form
-        folder_path = request.form['folder']
-        check_online = 'online' in request.form
-        extra_urls = request.form.get('extra_urls', '').strip()
-        
-        messages = []
-        
-        if is_encoded:
-            decoded_value = decode_password(password_to_check)
-            if decoded_value != password_to_check:
-                messages.append(f"Decoded to '{decoded_value}'")
-                password_to_check = decoded_value
-            else:
-                messages.append("Decoding attempt produced no change.")
-        
-        found = False
-        html = None
-        if os.path.exists(folder_path):
-            result = scan_password(password_to_check, folder_path)
-            messages.extend(result['messages'])
-            if result['found']:
-                found = True
-                html = result['html']
-        else:
-            messages.append("Invalid folder path. Please provide a valid path.")
-        
-        if not found and check_online:
-            urls = list(DEFAULT_ONLINE_LISTS)
-            if extra_urls:
-                urls.extend([u.strip() for u in extra_urls.split(",") if u.strip()])
-            online_result = scan_online_passwords(password_to_check, urls)
-            messages.extend(online_result['messages'])
-            if online_result['found']:
-                found = True
-        
-        return render_template_string("""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Password Checker</title>
-        </head>
-        <body>
-            <h1>Password Checker Results</h1>
-            <pre>{{ messages|join('\n') }}</pre>
-            {% if html %}
-            <hr>
-            {{ html|safe }}
-            {% endif %}
-            <br><a href="/">Check another password</a>
-        </body>
-        </html>
-        """, messages=messages, html=html)
-    
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Password Checker</title>
-    </head>
-    <body>
-        <h1>Password Checker</h1>
-        <form method="post">
-            <label>Password: <input type="text" name="password" required></label><br>
-            <label><input type="checkbox" name="encoded"> Is it encoded?</label><br>
-            <label>Folder path: <input type="text" name="folder" required></label><br>
-            <label><input type="checkbox" name="online"> Check online lists?</label><br>
-            <label>Extra URLs (comma-separated): <input type="text" name="extra_urls"></label><br>
-            <input type="submit" value="Check">
-        </form>
-    </body>
-    </html>
-    """)
+    cfg = _cfg()
+    return render_template("index.html", csrf=_csrf_token(), version=cfg["app"].get("version", "3.0"))
+
+
+@app.route("/api/status")
+def api_status():
+    return jsonify(_status_payload())
+
+
+@app.route("/api/check", methods=["POST"])
+def api_check():
+    data = request.get_json(silent=True) or {}
+    password = (data.get("password") or "").strip()
+    if not password:
+        return jsonify({"ok": False, "error": "password required"}), 400
+    try:
+        return jsonify(_run_check(password, data))
+    except Exception:
+        logger.exception("API check failed")
+        return jsonify({"ok": False, "error": "Check failed"}), 500
+
+
+@app.route("/prebuild", methods=["POST"])
+@_csrf_post
+def prebuild():
+    cfg, cache = _cfg(), path_from_config(_cfg(), "cache_dir")
+    msgs = []
+    for folder, kind, ci in [(path_from_config(cfg, "lists_dir"), "plain", True), (path_from_config(cfg, "hashes_dir"), "hash", False)]:
+        if folder.is_dir():
+            msgs.extend(prebuild_folder(folder, cache, kind, ci))
+    flash("; ".join(msgs[:6]) + ("…" if len(msgs) > 6 else ""))
+    return redirect(url_for("index"))
+
+
+@app.route("/download_lists", methods=["POST"])
+@_csrf_post
+def download_lists_route():
+    cfg = _cfg()
+    dl = cfg.get("download", {})
+    flash(" ".join(download_small_lists(cfg.get("small_lists_download", []), path_from_config(cfg, "lists_dir"), path_from_config(cfg, "cache_dir"), dl.get("timeout", 30), dl.get("retries", 3))[:8]))
+    return redirect(url_for("index"))
+
+
+@app.route("/clear_cache", methods=["POST"])
+@_csrf_post
+def clear_cache_route():
+    flash(f"Cache gewist: {', '.join(clear_cache(path_from_config(_cfg(), 'cache_dir'))) or 'leeg'}")
+    return redirect(url_for("index"))
+
+
+@app.route("/bulk", methods=["POST"])
+@_csrf_post
+def bulk():
+    f = request.files.get("file")
+    if not f:
+        flash("Geen bestand gekozen.")
+        return redirect(url_for("index"))
+    cfg = _cfg()
+    cache = path_from_config(cfg, "cache_dir")
+    upload = cache / "bulk_upload.txt"
+    f.save(upload)
+    out = cache / f"bulk_report_{int(time.time())}.csv"
+    bulk_check_file(upload, path_from_config(cfg, "lists_dir"), path_from_config(cfg, "hashes_dir"), cache, cfg, out)
+    flash(f"Rapport: {out.name}")
+    return redirect(url_for("index"))
+
+
+def cli_main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description="Password Checker")
+    p.add_argument("--build-index", metavar="FOLDER")
+    p.add_argument("--check", metavar="PASSWORD")
+    p.add_argument("--bulk", metavar="FILE")
+    p.add_argument("--clear-cache", action="store_true")
+    p.add_argument("--privacy", action="store_true")
+    args, _ = p.parse_known_args(argv)
+
+    cfg, cache = _cfg(), path_from_config(_cfg(), "cache_dir")
+    lists, hashes = path_from_config(cfg, "lists_dir"), path_from_config(cfg, "hashes_dir")
+    cache.mkdir(parents=True, exist_ok=True)
+
+    if args.clear_cache:
+        print("Cache:", ", ".join(clear_cache(cache)) or "empty")
+        return 0
+    if args.build_index:
+        kind = "hash" if "hash" in Path(args.build_index).name.lower() else "plain"
+        print("\n".join(prebuild_folder(Path(args.build_index), cache, kind, kind == "plain")))
+        return 0
+    if args.bulk:
+        out = cache / "bulk_report.csv"
+        bulk_check_file(Path(args.bulk), lists, hashes, cache, cfg, out)
+        print(f"Report: {out}")
+        return 0
+    if args.check:
+        r = _run_check(args.check, {"privacy": args.privacy})
+        print(r["status"])
+        print("\n".join(r["messages"]))
+        return 1 if r["found"] else 0
+    return -1
+
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    logging.basicConfig(level=logging.INFO)
+    cfg = _cfg()
+    app.secret_key = secret_key(cfg)
+    rc = cli_main(sys.argv[1:])
+    if rc == -1:
+        debug = os.environ.get("FLASK_DEBUG", "").lower() in ("1", "true", "yes")
+        app.run(host=cfg["app"].get("host", "127.0.0.1"), port=int(cfg["app"].get("port", 5000)), debug=debug, use_reloader=debug)
+    sys.exit(max(rc, 0))

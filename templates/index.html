@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}Password Checker{% endblock %}
+{% block content %}
+{% for msg in get_flashed_messages() %}
+<div class="flash">{{ msg }}</div>
+{% endfor %}
+
+<nav class="nav-tabs">
+  <button type="button" class="active" data-panel="check-panel">Controleren</button>
+  <button type="button" data-panel="tools-panel">Tools</button>
+  <button type="button" data-panel="status-panel">Status</button>
+  <button type="button" data-panel="api-panel">API</button>
+</nav>
+
+<section id="check-panel" class="panel active">
+  <div class="card">
+    <h2>Wachtwoord controleren</h2>
+    <p class="hint">Live check via API — HIBP, lokale lijsten en optioneel online bronnen.</p>
+
+    <form id="check-form">
+      <div class="field">
+        <label for="password">Wachtwoord</label>
+        <div class="input-row">
+          <input type="password" id="password" name="password" autocomplete="new-password" placeholder="Voer wachtwoord in" required>
+          <button type="button" class="btn btn-ghost" id="toggle-pwd">Toon</button>
+        </div>
+      </div>
+
+      <div class="options">
+        <label class="option"><input type="checkbox" data-option="encoded"> Decode</label>
+        <label class="option"><input type="checkbox" data-option="case_insensitive" checked> Hoofdletterongevoelig</label>
+        <label class="option"><input type="checkbox" data-option="variants" checked> Varianten</label>
+        <label class="option"><input type="checkbox" data-option="hibp" checked> HIBP</label>
+        <label class="option"><input type="checkbox" data-option="local" checked> Lokale lijsten</label>
+        <label class="option"><input type="checkbox" data-option="hashes" checked> Hash-lijsten</label>
+        <label class="option"><input type="checkbox" data-option="online"> Online lijsten</label>
+        <label class="option"><input type="checkbox" data-option="fast"> Snel profiel</label>
+        <label class="option"><input type="checkbox" data-option="only_hibp"> Alleen HIBP</label>
+        <label class="option"><input type="checkbox" data-option="substring"> Substring</label>
+        <label class="option"><input type="checkbox" data-option="privacy"> Privémodus</label>
+        <label class="option"><input type="checkbox" data-option="stop_early" checked> Stop bij eerste match</label>
+      </div>
+
+      <button type="submit" class="btn btn-primary" id="submit-btn">Controleren</button>
+    </form>
+  </div>
+
+  <div class="card" id="result-panel">
+    <h2>Resultaat</h2>
+    <div id="status-pill" class="status-pill safe">—</div>
+    <div id="result-sources" class="sources"></div>
+    <div id="strength-block" class="hidden"></div>
+    <pre id="result-log" class="log"></pre>
+    <div id="result-preview"></div>
+  </div>
+</section>
+
+<section id="tools-panel" class="panel">
+  <div class="card">
+    <h2>Onderhoud</h2>
+    <div class="tool-actions">
+      <form method="post" action="{{ url_for('prebuild') }}" style="display:inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit" class="btn btn-ghost">Index bouwen</button>
+      </form>
+      <form method="post" action="{{ url_for('download_lists') }}" style="display:inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit" class="btn btn-ghost">Lijsten downloaden</button>
+      </form>
+      <form method="post" action="{{ url_for('clear_cache') }}" style="display:inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit" class="btn btn-ghost">Cache wissen</button>
+      </form>
+    </div>
+    <p class="hint" style="margin-top:1rem">Bulk-check (upload .txt):</p>
+    <form method="post" action="{{ url_for('bulk') }}" enctype="multipart/form-data">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="input-row">
+        <input type="file" name="file" accept=".txt" required>
+        <button type="submit" class="btn btn-primary">CSV rapport</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section id="status-panel" class="panel">
+  <div class="card">
+    <h2>Systeemstatus</h2>
+    <div id="status-content"><p class="hint">Laden…</p></div>
+  </div>
+</section>
+
+<section id="api-panel" class="panel">
+  <div class="card">
+    <h2>Live API</h2>
+    <div class="api-doc">
+      <p><code>GET /api/status</code> — health & stats</p>
+      <p><code>POST /api/check</code> — JSON body:</p>
+      <pre>{
+  "password": "your-password",
+  "hibp": true,
+  "local": true,
+  "hashes": true,
+  "online": false,
+  "variants": true,
+  "encoded": false,
+  "privacy": false
+}</pre>
+    </div>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+{% endblock %}
