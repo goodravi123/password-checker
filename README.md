@@ -9,11 +9,16 @@ Check if a password appears in known wordlists or the [Have I Been Pwned](https:
 - HIBP k-anonymity API, local wordlists, hash lists, optional online lists
 - Password variants (leet, normalize), strength score, optional zxcvbn
 
-## Quick start
+## Quick start (Windows)
+
+1. Dubbelklik **`setup.bat`** (maakt `.venv` + installeert packages)
+2. Dubbelklik **`run.bat`**
+
+Of handmatig:
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate          # Windows
+.venv\Scripts\activate
 pip install -r requirements.txt
 python app.py
 ```
